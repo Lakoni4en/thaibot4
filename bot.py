@@ -158,11 +158,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_destination_choice(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    """Обработка нажатия на кнопки с выбором направления."""
     query = update.callback_query
+    if not query:
+        return
+
+    logger.info("CallbackQuery received: %s", query.data)
+
+    # Обязательно отвечаем на callback, чтобы "крутилка" у пользователя исчезла
     await query.answer()
 
-    data = query.data
+    data = query.data or ""
     if not data.startswith("dest_"):
+        logger.warning("Unknown callback data: %s", data)
         return
 
     destination = data.split("_", maxsplit=1)[1]
@@ -226,7 +234,8 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CallbackQueryHandler(handle_destination_choice, pattern=r"^dest_"))
+    # Ловим все callback-и и уже внутри проверяем data
+    application.add_handler(CallbackQueryHandler(handle_destination_choice))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date_message)
     )
