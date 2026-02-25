@@ -1,207 +1,240 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime
+from typing import List, Dict, Any
 
-import aiohttp
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram_calendar import SimpleCalendar, simple_cal_callback
-from dotenv import load_dotenv
-
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-AVIASALES_TOKEN = "6c48242837234d39f1e8320332f1f779"
-
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+import requests
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 
-class FlightSearch(StatesGroup):
-    destination = State()
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+AVIASALES_API_KEY = os.getenv(
+    "AVIASALES_API_KEY", "6c48242837234d39f1e8320332f1f779"
+)
+
+# Коды городов / аэропортов
+ORIGIN_CODE = "MOW"  # Москва (городской код)
 DESTINATIONS = {
-    "bkk": {"name": "Бангкок", "code": "BKK"},
-    "utp": {"name": "Паттайя", "code": "UTP"}
+    "UTP": "Паттайя (аэропорт U-Tapao)",
+    "BKK": "Бангкок (аэропорт Suvarnabhumi)",
 }
 
 
-async def get_direct_flights(dest_code: str, dep_date: date = None):
-    """Поиск прямых рейсов. Если dep_date=None — ближайшие 3 месяца"""
-    origin = "MOW"
-    flights = []
+def search_direct_flights(destination: str, departure_date: datetime.date) -> List[Dict[str, Any]]:
+    """
+    Поиск прямых перелётов через Aviasales API (Travelpayouts).
+    Документация: prices_for_dates v3.
+    """
+    if not AVIASALES_API_KEY:
+        logger.warning("AVIASALES_API_KEY is not set")
+        return []
 
-    if dep_date:
-        # точная дата
-        dates = [dep_date.strftime("%Y-%m-%d")]
-    else:
-        # ближайшие ~3 месяца
-        dates = [(datetime.now() + timedelta(days=30 * i)).strftime("%Y-%m") for i in range(4)]
+    url = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
+    params = {
+        "origin": ORIGIN_CODE,
+        "destination": destination,
+        "departure_at": departure_date.isoformat(),
+        "direct": "true",
+        "one_way": "true",
+        "sorting": "price",
+        "limit": 10,
+        "token": AVIASALES_API_KEY,
+        "currency": "rub",
+        "locale": "ru",
+    }
 
-    for d in dates:
-        url = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
-        params = {
-            "origin": origin,
-            "destination": dest_code,
-            "departure_at": d,
-            "one_way": "true",
-            "direct": "true",
-            "sorting": "price",
-            "limit": 15,
-            "currency": "rub",
-            "token": AVIASALES_TOKEN
-        }
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        logger.error("Error calling Aviasales API: %s", e)
+        return []
 
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            try:
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("success"):
-                            flights.extend(data.get("data", []))
-            except:
-                continue
-
-    flights = [f for f in flights if f.get("price")]
-    flights.sort(key=lambda x: x["price"])
-    return flights[:10]
+    flights = data.get("data") or data.get("tickets") or []
+    if isinstance(flights, dict):
+        flights = list(flights.values())
+    return flights
 
 
-def format_flights(flights, city_name, selected_date=None):
+def format_flights_message(
+    flights: List[Dict[str, Any]], destination: str, departure_date: datetime.date
+) -> str:
     if not flights:
-        return f"❌ Прямых рейсов в {city_name} не найдено на выбранный период 😔"
+        return (
+            f"К сожалению, я не нашёл прямых перелётов из Москвы в {DESTINATIONS.get(destination, destination)} "
+            f"на дату {departure_date.strftime('%d.%m.%Y')}."
+        )
 
-    text = f"<b>✈️ Прямые рейсы Москва → {city_name}</b>\n"
-    if selected_date:
-        text += f"<b>Дата: {selected_date.strftime('%d %B %Y')}</b>\n\n"
-    else:
-        text += "<b>Ближайшие рейсы (3+ месяца)</b>\n\n"
+    lines = [
+        f"Прямые рейсы из Москвы в {DESTINATIONS.get(destination, destination)}",
+        f"Дата вылета: {departure_date.strftime('%d.%m.%Y')}",
+        "",
+    ]
 
-    for f in flights:
-        dep = datetime.fromisoformat(f["departure_at"].replace("Z", "+00:00"))
-        date_str = dep.strftime("%d.%m %H:%M")
-        price = f'{f["price"]:,}'.replace(',', ' ')
-        airline = f.get("airline", "??")
-        duration = f.get("duration", 0) // 60
+    for i, f in enumerate(flights[:5], start=1):
+        price = f.get("price") or f.get("value")
+        airline = f.get("airline") or f.get("airline_iata") or "авиакомпания не указана"
+        flight_number = f.get("flight_number") or ""
 
-        link = f"https://www.aviasales.ru{f.get('link', '')}" if f.get("link") else "#"
+        depart_at = f.get("departure_at") or f.get("departure_time")
+        return_at = f.get("return_at") or f.get("arrival_time")
 
-        text += f"<b>{date_str}</b> — <b>{price} ₽</b>\n"
-        text += f"   {airline} • {duration} ч\n"
-        text += f"   <a href='{link}'>Купить билет →</a>\n\n"
+        def fmt_time(value: Any) -> str:
+            if not value:
+                return "не указано"
+            text = str(value)
+            for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(text, fmt)
+                    return dt.strftime("%d.%m %H:%M")
+                except Exception:
+                    continue
+            return text
 
-    text += "\n<i>Данные из кэша Aviasales • цены меняются</i>"
-    return text
+        depart_str = fmt_time(depart_at)
+        arrive_str = fmt_time(return_at)
+
+        line = f"{i}) {airline} {flight_number} — вылет {depart_str}, прилёт {arrive_str}"
+        if price:
+            line += f", цена от {price} ₽"
+        lines.append(line)
+
+    # Примерная deeplink-ссылка на Aviasales (без API, просто ссылка на поиск)
+    date_str = departure_date.strftime("%Y%m%d")
+    deeplink = f"https://www.aviasales.ru/search/{ORIGIN_CODE}{destination}{date_str}1"
+
+    lines.append("")
+    lines.append("Подробнее и покупка билетов:")
+    lines.append(deeplink)
+
+    return "\n".join(lines)
 
 
-# ====================== ХЕНДЛЕРЫ ======================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [
+            InlineKeyboardButton("Паттайя", callback_data="dest_UTP"),
+            InlineKeyboardButton("Бангкок", callback_data="dest_BKK"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌴 Паттайя (UTP)", callback_data="utp")],
-        [InlineKeyboardButton(text="🏙 Бангкок (BKK)", callback_data="bkk")]
-    ])
-    await message.answer(
-        "👋 Привет! Я ищу <b>только прямые</b> рейсы из Москвы.\nВыбери направление:",
-        reply_markup=kb
+    text = (
+        "Привет! Я помогу найти *прямые* перелёты из Москвы:\n\n"
+        "• в Паттайю\n"
+        "• в Бангкок\n\n"
+        "Выбери направление:"
     )
 
-
-@dp.callback_query(lambda c: c.data in DESTINATIONS)
-async def choose_action(callback: types.CallbackQuery, state: FSMContext):
-    code = callback.data
-    dest = DESTINATIONS[code]
-    await state.update_data(destination=code)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Выбрать дату вылета", callback_data=f"date:{code}")],
-        [InlineKeyboardButton(text="🔥 Ближайшие рейсы", callback_data=f"nearest:{code}")],
-        [InlineKeyboardButton(text="← Другое направление", callback_data="back")]
-    ])
-
-    await callback.message.edit_text(
-        f"✅ Направление: <b>{dest['name']}</b>\n\nЧто смотрим?",
-        reply_markup=kb
-    )
+    if update.message:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(
+            text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
 
 
-@dp.callback_query(lambda c: c.data.startswith("date:"))
-async def show_calendar(callback: types.CallbackQuery, state: FSMContext):
-    _, code = callback.data.split(":")
-    await state.update_data(destination=code)
-    dest_name = DESTINATIONS[code]["name"]
+async def handle_destination_choice(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
 
-    await callback.message.edit_text(
-        f"📆 Выбери дату вылета в <b>{dest_name}</b>:",
-        reply_markup=await SimpleCalendar(locale='ru').start_calendar()   # русский календарь
-    )
-
-
-@dp.callback_query(simple_cal_callback.filter())
-async def process_date_selection(callback: types.CallbackQuery, callback_data: dict, state: FSMContext):
-    selected, selected_date = await SimpleCalendar(locale='ru').process_selection(callback, callback_data)
-
-    if not selected:
+    data = query.data
+    if not data.startswith("dest_"):
         return
 
-    data = await state.get_data()
-    dest_code = data["destination"]
-    dest_name = DESTINATIONS[dest_code]["name"]
+    destination = data.split("_", maxsplit=1)[1]
+    context.user_data["destination"] = destination
 
-    await callback.message.edit_text(f"🔍 Ищу прямые рейсы на <b>{selected_date.strftime('%d %B %Y')}</b>...")
+    human_name = DESTINATIONS.get(destination, destination)
 
-    flights = await get_direct_flights(dest_code, selected_date)
-    text = format_flights(flights, dest_name, selected_date)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Другая дата", callback_data=f"date:{dest_code}")],
-        [InlineKeyboardButton(text="🔥 Ближайшие рейсы", callback_data=f"nearest:{dest_code}")],
-        [InlineKeyboardButton(text="← Города", callback_data="back")]
-    ])
-
-    await callback.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await query.message.reply_text(
+        f"Напиши дату вылета в формате ГГГГ-ММ-ДД.\n\n"
+        f"Например: `2026-03-10`\n\n"
+        f"Направление: Москва → {human_name}",
+        parse_mode="Markdown",
+    )
 
 
-@dp.callback_query(lambda c: c.data.startswith("nearest:"))
-async def show_nearest(callback: types.CallbackQuery, state: FSMContext):
-    _, code = callback.data.split(":")
-    dest_name = DESTINATIONS[code]["name"]
+async def handle_date_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if "destination" not in context.user_data:
+        # Пользователь пока не выбрал направление
+        return
 
-    await callback.message.edit_text(f"🔍 Ищу ближайшие прямые рейсы в {dest_name}...")
+    destination = context.user_data["destination"]
+    date_text = (update.message.text or "").strip()
 
-    flights = await get_direct_flights(code)          # без даты = ближайшие
-    text = format_flights(flights, dest_name)
+    try:
+        departure_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+    except ValueError:
+        await update.message.reply_text(
+            "Не получилось распознать дату 😔\n"
+            "Пожалуйста, введи дату в формате ГГГГ-ММ-ДД, например: 2026-03-10"
+        )
+        return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Выбрать дату", callback_data=f"date:{code}")],
-        [InlineKeyboardButton(text="← Другое направление", callback_data="back")]
-    ])
+    await update.message.reply_text("Ищу прямые рейсы, подожди пару секунд…")
 
-    await callback.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    flights = await asyncio.to_thread(search_direct_flights, destination, departure_date)
+    message = format_flights_message(flights, destination, departure_date)
 
+    await update.message.reply_text(message)
 
-@dp.callback_query(lambda c: c.data == "back")
-async def back_to_cities(callback: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌴 Паттайя (UTP)", callback_data="utp")],
-        [InlineKeyboardButton(text="🏙 Бангкок (BKK)", callback_data="bkk")]
-    ])
-    await callback.message.edit_text("Выбери направление:", reply_markup=kb)
+    # Сбрасываем состояние, чтобы можно было начать поиск заново
+    context.user_data.pop("destination", None)
 
 
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    print("🚀 Бот с календарем запущен!")
-    await dp.start_polling(bot)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Команды:\n"
+        "/start — начать поиск\n"
+        "/help — помощь\n\n"
+        "Алгоритм работы:\n"
+        "1) Нажми Паттайя или Бангкок\n"
+        "2) Введи дату вылета в формате ГГГГ-ММ-ДД\n"
+        "3) Получи список прямых рейсов 😉"
+    )
+
+
+def main() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set")
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(handle_destination_choice, pattern=r"^dest_"))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date_message)
+    )
+
+    logger.info("Bot is starting (long polling)…")
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
+
